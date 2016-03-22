@@ -1,0 +1,179 @@
+#cloud-config
+
+ssh_authorized_keys:
+  - ssh-rsa xxxxxxxxxx
+
+coreos:
+  update:
+    reboot-strategy: best-effort
+  units:
+    - name: docker.service
+      command: start
+    - name: timezone.service
+      command: start
+      content: |
+        [Unit]
+        Description=timezone
+        [Service]
+        Type=oneshot
+        RemainAfterExit=yes
+        ExecStart=/usr/bin/ln -sf ../usr/share/zoneinfo/Japan /etc/localtime
+
+    - name: nginx-proxy.service
+      content: |
+        [Unit]
+        Description=nginx-proxy
+
+        [Service]
+        Type=simple
+        Restart=always
+        ExecStartPre=-/usr/bin/docker stop nginx-proxy
+        ExecStart=/usr/bin/docker run \
+                    --rm \
+                    --name="nginx-proxy" \
+                    -p 80:80 \
+                    -p 443:443 \
+                    -v /home/core/certs:/etc/nginx/certs:ro \
+                    -v /etc/nginx/vhost.d \
+                    -v /usr/share/nginx/html \
+                    -v /var/run/docker.sock:/tmp/docker.sock \
+                    jwilder/nginx-proxy
+        ExecStop=/usr/bin/docker stop nginx-proxy
+
+        [Install]
+        WantedBy=multi-user.target
+
+    - name: letsencrypt.service
+      content: |
+        [Unit]
+        Description=letsencrypt
+        Requires=nginx-proxy.service
+        After=nginx-proxy.service
+
+        [Service]
+        Type=simple
+        Restart=always
+        ExecStartPre=-/usr/bin/docker stop letsencrypt
+        ExecStart=/usr/bin/docker run \
+                    --rm \
+                    --name="letsencrypt" \
+                    -v /home/core/repos/server-scripts/server/certs:/etc/nginx/certs:rw \
+                    --volumes-from nginx-proxy \
+                    -v /var/run/docker.sock:/var/run/docker.sock:ro \
+                    jrcs/letsencrypt-nginx-proxy-companion
+        ExecStop=/usr/bin/docker stop letsencrypt
+
+        [Install]
+        WantedBy=multi-user.target
+
+    - name: newrelic.service
+      command: start
+      content: |
+        [Unit]
+        Description=newrelic
+        Requires=docker.service
+        After=docker.service
+        
+        [Service]
+        Restart=always
+        RestartSec=300
+        TimeoutStartSec=10m
+        ExecStartPre=-/usr/bin/docker stop newrelic
+        ExecStartPre=-/usr/bin/docker rm -f newrelic
+        ExecStartPre=-/usr/bin/docker pull uzyexe/newrelic:latest
+        ExecStart=/usr/bin/docker run \
+                    --rm \
+                    --name="newrelic" \
+                    --memory="64m" \
+                    --memory-swap="-1" \
+                    --net="host" \
+                    --pid="host" \
+                    --env="NEW_RELIC_LICENSE_KEY=" \
+                    --volume="/var/run/docker.sock:/var/run/docker.sock:ro" \
+                    --volume="/sys/fs/cgroup/:/sys/fs/cgroup:ro" \
+                    --volume="/dev:/dev" \
+                    uzyexe/newrelic
+        ExecStop=/usr/bin/docker stop newrelic
+        
+        [Install]
+        WantedBy=multi-user.target
+
+    - name: docker-registry.service
+      command: start
+      content: |
+        [Unit]
+        Description=docker registry
+        Requires=docker.service
+        After=docker.service
+
+        [Service]
+        Restart=always
+        RestartSec=300
+        TimeoutStartSec=10m
+        ExecStart=/usr/bin/docker run \
+                    --rm \
+                    --name="docker-registry-service" \
+                    -p 5000:5000 \
+                    -e REGISTRY_STORAGE_S3_ACCESSKEY= \
+                    -e REGISTRY_STORAGE_S3_SECRETKEY= \
+                    -e REGISTRY_STORAGE_S3_BUCKET= \
+                    -e REGISTRY_STORAGE_S3_REGION=ap-northeast-1 \
+                    -e REGISTRY_STORAGE_S3_ROOTDIRECTORY=/v2 \
+                    -e REGISTRY_STORAGE=s3 \
+                    registry:2.0
+        ExecStop=/usr/bin/docker stop docker-registry-service
+
+        [Install]
+        WantedBy=multi-user.target
+
+    - name: sample.service
+      content: |
+        [Unit]
+        Description=sample
+        Requires=docker-registry.service
+        After=docker-registry.serivce
+
+        [Service]
+        Type=simple
+        Restart=always
+        ExecStartPre=-/usr/bin/docker stop sample
+        ExecStart=/usr/bin/docker run \
+                    --rm \
+                    --name="hoge" \
+                    -e "VIRTUAL_HOST=sample.example.com" \
+                    -e "LETSENCRYPT_HOST=sample.example.com" \
+                    -e "LETSENCRYPT_EMAIL=sample@example.com" \
+                    -e "TZ=Asia/Tokyo" \
+                    -e "RAILS_ENV=production" \
+                    -e "RAILS_DATABASE_USER=" \
+                    -e "RAILS_DATABASE_PASSWORD=" \
+                    -e "RAILS_DATABASE_HOST=" \
+                    -e "RAILS_DATABASE=" \
+                    -e "SECRET_KEY_BASE=" \
+                    localhost:5000/sample
+        ExecStop=/usr/bin/docker stop sample
+
+        [Install]
+        WantedBy=multi-user.target
+
+
+    - name: sample-job.service
+      content: |
+        [Unit]
+        Description=sample-job
+        Requires=docker-registry.service
+        After=docker-registry.serivce
+        [Service]
+        Type=oneshot
+        ExecStart=/usr/bin/docker run \
+                    --rm \
+                    -e "TZ=Asia/Tokyo" \
+                    localhost:5000/sample-job
+    - name: sample-job.timer
+      command: start
+      content: |
+        [Unit]
+        Description=Run sample-job
+        [Timer]
+        OnCalendar=*:*
+
